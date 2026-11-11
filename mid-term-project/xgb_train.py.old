@@ -1,0 +1,128 @@
+import pandas as pd
+import numpy as np
+import re
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import KFold
+import xgboost as xgb
+import pickle
+
+def clean_model_name(row):
+    text = re.sub(rf'^{re.escape(row["brand"])}\s+', '', row['full_model_name'], flags=re.IGNORECASE)
+    words = text.split()
+    multi_word = {'7', '5', '3', '6', 'range', 'swift', 'grand', 'wagon', 'alto', 'innova', 'corolla', 'land', 'continental'}
+    if len(words) >= 2 and words[0].lower() in multi_word:
+        return f"{words[0]} {words[1]}"
+    return words[0] if words else row['model_name']
+    
+def prep_train(df):
+    dicts = df.to_dict(orient='records')
+    dv = DictVectorizer(sparse=False)
+    x_train = dv.fit_transform(dicts)
+    return x_train, dv
+
+# Main code
+df = pd.read_csv('cars.csv')
+
+for col in ['Id','year']:
+    if col in df.columns:
+        del df[col]
+    
+df = df.drop_duplicates().reset_index(drop=True)
+
+categorical = df.select_dtypes(include='str').columns.tolist()
+numerical = df.select_dtypes(include='number').columns.tolist()
+
+patt = r'\b(at|mt|automatic|manual|multitronic|tiptronic|amt|cvt|dct|dsg|vtvt|vct)\b'
+
+df['transmission'] = df['full_model_name'].str.extract(patt, flags=re.IGNORECASE, expand=False).str.upper().fillna('UNKNOWN')
+df['engine_litres'] = df['full_model_name'].str.extract(r'(\d\.\d)', expand=False)
+df['engine_litres'] = (df['engine_litres'] + 'L').fillna('UNKNOWN')
+df['model_name_clean'] = df.apply(clean_model_name, axis=1)
+
+for col in ['engine_litres', 'transmission', 'model_name_clean']:
+    if col not in categorical:
+        categorical.append(col)
+        
+df['fuel_type'] = df['fuel_type'].str.replace(r'\s*\+\s*\d+', '', regex=True)
+
+if 'Zest' in df['model_name'].values:
+    df.loc[(df['model_name'] == 'Zest') & (df['price'] > 495000.0), 'price'] = 455000.0
+
+numerical = [num for num in numerical if num != 'price']
+categorical = [cat for cat in categorical if (cat != 'full_model_name' and cat != 'model_name')]
+ 
+# Standardize feature processing 
+base_features = categorical + numerical
+x_train, dv = prep_train(df[base_features])
+
+xgb_scores = []
+kfld = KFold(n_splits=5, shuffle=True, random_state=42)
+
+x_train_df = pd.DataFrame(x_train, columns=dv.get_feature_names_out())
+y_train_series = pd.Series(df['price'])
+
+# We iterate on df's index to safely query grouping text properties
+for train_idx, val_idx in kfld.split(df):
+    # Slice the one-hot encoded dataset 
+    x_train_xgb = x_train_df.iloc[train_idx].copy()
+    x_val_xgb = x_train_df.iloc[val_idx].copy()
+    
+    y_train_xgb = y_train_series.iloc[train_idx]
+    y_val_xgb = y_train_series.iloc[val_idx]
+    
+    # Target features must be calculated from the original text categories matching train layout
+    df_train_fold = df.iloc[train_idx]
+    df_val_fold = df.iloc[val_idx]
+    
+    global_median = y_train_xgb.median()
+    brand_medians = df_train_fold.groupby('brand')['price'].median()
+    model_median = df_train_fold.groupby('model_name_clean')['price'].median()
+    
+    x_train_xgb['brand_median_price'] = df_train_fold['brand'].map(brand_medians).fillna(global_median).values
+    x_train_xgb['model_median_price'] = df_train_fold['model_name_clean'].map(model_median).fillna(x_train_xgb['brand_median_price']).values
+    x_train_xgb['depreciated_model_val'] = (x_train_xgb['model_median_price'] / (df_train_fold['car_age'].values + 1))
+
+    x_val_xgb['brand_median_price'] = df_val_fold['brand'].map(brand_medians).fillna(global_median).values
+    x_val_xgb['model_median_price'] = df_val_fold['model_name_clean'].map(model_median).fillna(x_val_xgb['brand_median_price']).values
+    x_val_xgb['depreciated_model_val'] = (x_val_xgb['model_median_price'] / (df_val_fold['car_age'].values + 1))
+    
+    feature_cols = x_train_xgb.columns.tolist()
+    
+    dtrain = xgb.DMatrix(x_train_xgb, label=y_train_xgb, feature_names=feature_cols)
+    dval = xgb.DMatrix(x_val_xgb, label=y_val_xgb, feature_names=feature_cols)
+    
+    watch_list = [(dtrain, 'train'), (dval, 'val')]
+    evals_result = {}
+                  
+    xgb_params = {
+        'eta': 0.3,
+        'max_depth': 6,
+        'min_child_weight': 1,
+        'objective': 'reg:absoluteerror',
+        'eval_metric': 'mae',
+        'nthread': 8,
+        'seed': 42,
+        'verbosity': 1
+    }
+
+    xgb_model = xgb.train(
+        params=xgb_params,
+        dtrain=dtrain,
+        num_boost_round=200,
+        evals=watch_list,
+        evals_result=evals_result,
+        verbose_eval=False
+    )
+
+    y_pred_xgb = xgb_model.predict(dval)
+    mae_xgb = mean_absolute_error(y_val_xgb, y_pred_xgb)
+    xgb_scores.append(mae_xgb)
+
+print(f"Mean of MAE error from XGBoost model best parameters after tuning, final model mae = {round(np.mean(xgb_scores), 2)}")
+
+with open('xgb_regressor.bin','wb') as f_out:
+    pickle.dump((dv,xgb_model),f_out)
+    
+print(f"The model is saved to xgb_regressor.bin file in current directory")
